@@ -95,7 +95,7 @@ public final class WorkerService extends Service {
             File nativeDir = new File(getApplicationInfo().nativeLibraryDir);
             String launcher = executable(nativeDir, "libcorevision_probe.so");
             String servicePid = Integer.toString(Process.myPid());
-            RuntimePack runtime = probe ? null : RuntimePack.verify(this);
+            RuntimePack runtime = probe ? null : RuntimePack.verify(this, request.operation());
             String timeout = Long.toString(remainingMillis(deadline));
             ProcessBuilder builder;
             if (probe) {
@@ -130,7 +130,7 @@ public final class WorkerService extends Service {
                 if (encoded.length > Wire.MAX_METADATA) throw error(PROTOCOL, "Worker report is too large");
                 response.write(output, request.id(), encoded.length);
                 output.write(encoded);
-                Wire.copy(pipe, output, response.alpha() + response.foreground() + response.coarse());
+                Wire.copy(pipe, output, response.payload() + response.foreground() + response.coarse());
                 if (pipe.read() != -1) throw error(PROTOCOL, "Unexpected extra response bytes");
             }
             int status = child.waitFor();

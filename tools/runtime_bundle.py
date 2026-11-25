@@ -13,6 +13,8 @@ from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE = ROOT / "corevision-android/src/main/assets/corevision/profile.sha256"
+FACE_PROFILE = PROFILE.with_name("profile-face.sha256")
+COMPARISON_PROFILE = PROFILE.with_name("profile-face-comparison.sha256")
 MANIFEST = "assets/corevision/runtime.sha256"
 LOADER = "libcorevision_musl.so"
 BRIDGES = {"libcorevision_probe.so", "libcorevision_worker.so"}
@@ -41,6 +43,13 @@ def parse_manifest(contents):
 
 def verify_pin_hashes(entries):
     required = parse_manifest(PROFILE.read_bytes())
+    face = parse_manifest(FACE_PROFILE.read_bytes())
+    comparison = parse_manifest(COMPARISON_PROFILE.read_bytes())
+    if comparison.keys() & entries.keys():
+        required.update(comparison)
+        required.update(face)
+    elif face.keys() & entries.keys():
+        required.update(face)
     for path, expected in required.items():
         if entries.get(path) != expected:
             raise ValueError(f"Unsupported or missing runtime file {path}")
@@ -94,9 +103,13 @@ def prepare(args):
         if not path.is_file() or not LIBRARY.fullmatch(path.name) or path.name == "libc.so" or path.name.startswith("libcorevision_"):
             raise ValueError(f"Unexpected entry in the flat runtime library directory: {path.name}")
         sources[f"lib/{path.name}"] = path
-    for relative in parse_manifest(PROFILE.read_bytes()):
+    profiles = (PROFILE, FACE_PROFILE) if args.include_face or args.face_comparison_model else (PROFILE,)
+    for relative in (path for profile in profiles for path in parse_manifest(profile.read_bytes())):
         if relative.startswith("models/"):
             sources[relative] = args.models / relative.split("/", 1)[1]
+    if args.face_comparison_model is not None:
+        for relative in parse_manifest(COMPARISON_PROFILE.read_bytes()):
+            sources[relative] = args.face_comparison_model
 
     with tempfile.TemporaryDirectory(prefix=".corevision-runtime-", dir=output.parent) as temporary:
         draft = Path(temporary) / "bundle"
@@ -155,14 +168,17 @@ def verify_apk(bundle, apk):
 def verify_aar(aar):
     with ZipFile(aar) as archive:
         names = {name for name in archive.namelist() if not name.endswith("/")}
-        required = {"AndroidManifest.xml", "classes.jar", "assets/corevision/profile.sha256"}
+        profiles = {f"assets/corevision/{profile.name}": profile
+                    for profile in (PROFILE, FACE_PROFILE, COMPARISON_PROFILE)}
+        required = {"AndroidManifest.xml", "classes.jar", *profiles}
         expected = {f"jni/arm64-v8a/{name}" for name in BRIDGES}
         if not required <= names or names & {MANIFEST} or {name for name in names if name.startswith("jni/")} != expected:
             raise ValueError("Public AAR must contain just the self-developed ARM64 bridges and the ABI profile")
-        if {name for name in names if name.startswith("assets/")} != {"assets/corevision/profile.sha256"}:
+        if {name for name in names if name.startswith("assets/")} != profiles.keys():
             raise ValueError("Public AAR contains an unexpected asset")
-        if archive.read("assets/corevision/profile.sha256") != PROFILE.read_bytes():
-            raise ValueError("Public AAR contains an unexpected ABI profile")
+        for name, profile in profiles.items():
+            if archive.read(name) != profile.read_bytes():
+                raise ValueError(f"Public AAR contains an unexpected profile {name}")
         for name in expected:
             with archive.open(name) as content:
                 assert_bridge_elf(content, name)
@@ -175,6 +191,8 @@ def main():
     create = commands.add_parser("prepare")
     for argument in ("loader", "libs", "models", "output"):
         create.add_argument(f"--{argument}", required=True, type=Path)
+    create.add_argument("--include-face", action="store_true", help="also include the verified face detection models")
+    create.add_argument("--face-comparison-model", type=Path, help="include the original face comparison model and face detection")
     commands.add_parser("verify").add_argument("bundle", type=Path)
     apk = commands.add_parser("verify-apk")
     apk.add_argument("bundle", type=Path)

@@ -1,4 +1,4 @@
-#include "wire.h"
+#include "face_feature.h"
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -77,7 +77,7 @@ struct DataCell {
 
 static_assert(sizeof(dllite::IOTensor) == 72 && offsetof(dllite::IOTensor, data) == 56);
 static_assert(sizeof(CVAlgo::DataCell) == 16 && sizeof(std::string) == 24);
-static_assert(sizeof(CvRequest) == 36 && sizeof(CvResponse) == 40);
+static_assert(sizeof(CvRequest) == 36 && sizeof(CvResponse) == 40 && sizeof(CvFace) == 76);
 
 static std::atomic<unsigned int> cpuConfigured{0};
 static std::atomic<bool> cpuFailed{false};
@@ -122,6 +122,14 @@ constexpr size_t OUTPUT_SINK_OFFSET = 40;
 constexpr size_t OUTPUT_READY_OFFSET = 360;
 constexpr size_t IMAGE_RESULT_SIZE = 0x540;
 constexpr size_t SEGMENT_RESULT_OFFSET = 256;
+constexpr unsigned int FACE_SCENE = 0;
+constexpr size_t FACE_RESULT_OFFSET = 400;
+constexpr size_t LANDMARK_RESULT_OFFSET = 624;
+constexpr size_t POSE_RESULT_OFFSET = 656;
+constexpr size_t OCCLUSION_RESULT_OFFSET = 856;
+constexpr size_t FACE_PROBABILITY_RESULT_OFFSET = 1136;
+constexpr size_t FACE_RECT_BYTES = 28;
+constexpr size_t VECTOR_HEADER_BYTES = 24;
 
 template<typename Type>
 Type field(const void *object, size_t offset) {
@@ -195,8 +203,8 @@ struct Mask {
     size_t stride;
 };
 
-Mask waitForMask(int fd, const CvRequest &request, const Api &api, const Scene &scene,
-                 void *result, uint32_t failure) {
+void waitForResult(int fd, const CvRequest &request, const Api &api, const Scene &scene,
+                   void *result, uint32_t failure) {
     auto *sink = field<const uint8_t *>(scene.get(), OUTPUT_SINK_OFFSET);
     if (!sink) fail(fd, request, failure, "Missing output sink");
     api.constructResult(result);
@@ -204,7 +212,11 @@ Mask waitForMask(int fd, const CvRequest &request, const Api &api, const Scene &
     for (unsigned int attempt = 0; *ready == 0 && attempt < 1000; ++attempt) usleep(20000);
     if (*ready == 0) fail(fd, request, CV_TIMEOUT, "Timed out waiting for a scene result");
     if (api.getResult(sink, result) != 1) fail(fd, request, failure, "Output sink rejected result");
+}
 
+Mask waitForMask(int fd, const CvRequest &request, const Api &api, const Scene &scene,
+                 void *result, uint32_t failure) {
+    waitForResult(fd, request, api, scene, result, failure);
     Mask mask{field<uint32_t>(result, 276), field<uint32_t>(result, 272), field<float>(result, 360),
               field<const uint8_t *>(result, 280), 0};
     const auto *stride = field<const size_t *>(result, 336);
@@ -291,6 +303,134 @@ int64_t milliseconds() {
     return static_cast<int64_t>(current.tv_sec) * 1000 + current.tv_nsec / 1000000;
 }
 
+std::string runtimeMetadata(int fd, const CvRequest &request, const char *enginePath, int64_t start,
+                            const char *sceneDetails) {
+    char context[128] = "unavailable";
+    cv_context(context, sizeof(context));
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    char details[512];
+    const int length = snprintf(details, sizeof(details),
+        "pid=%d\nuid=%d\npageSize=%ld\nselinux=%s\ncpu=MS_CPU\ncpuConfigurations=%u\n"
+        "%sworkerMillis=%lld\nworkerPeakRssKiB=%ld\n",
+        getpid(), (int)getuid(), sysconf(_SC_PAGESIZE), context, cpuConfigured.load(), sceneDetails,
+        static_cast<long long>(milliseconds() - start), usage.ru_maxrss);
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(details)) _Exit(3);
+    const char *slash = std::strrchr(enginePath, '/');
+    if (slash == nullptr) fail(fd, request, CV_INCOMPATIBLE, "Missing installed library directory");
+    LoadedObjects loaded{std::string(enginePath, static_cast<size_t>(slash - enginePath + 1)),
+                         std::string(details, static_cast<size_t>(length))};
+    if (dl_iterate_phdr(loadedObject, &loaded) != 0) {
+        fail(fd, request, CV_INCOMPATIBLE, "Native mapping outside the installed library directory");
+    }
+    return loaded.metadata;
+}
+
+[[noreturn]] void sendResult(int fd, const CvRequest &request, const void *payload, uint32_t size,
+                            const std::string &metadata, const std::vector<uint8_t> &foreground = {},
+                            const std::vector<uint8_t> &coarse = {}) {
+    const CvResponse response{CV_MAGIC, CV_VERSION, request.id, 0, request.width, request.height,
+                              size, static_cast<uint32_t>(foreground.size()), static_cast<uint32_t>(coarse.size()),
+                              static_cast<uint32_t>(metadata.size())};
+    const bool sent = cv_write(fd, &response, sizeof(response)) && cv_write(fd, metadata.data(), metadata.size()) &&
+        cv_write(fd, payload, size) && cv_write(fd, foreground.data(), foreground.size()) &&
+        cv_write(fd, coarse.data(), coarse.size());
+    _Exit(sent ? 0 : 4);
+}
+
+const uint8_t *vectorData(const void *vector, size_t expectedBytes) {
+    const auto begin = field<uintptr_t>(vector, 0);
+    const auto end = field<uintptr_t>(vector, 8);
+    const auto capacity = field<uintptr_t>(vector, 16);
+    if (begin == 0 || end < begin || end - begin != expectedBytes || capacity < end) return nullptr;
+    return reinterpret_cast<const uint8_t *>(begin);
+}
+
+std::vector<CvFace> readFaces(int fd, const CvRequest &request, const uint8_t *result) {
+    const auto count = field<uint32_t>(result, FACE_RESULT_OFFSET + 8);
+    if (count > CV_MAX_FACES) fail(fd, request, CV_FACE_DETECTION, "Unexpected native face count");
+    if (count == 0) return {};
+
+    const auto *rects = vectorData(result + FACE_RESULT_OFFSET + 16, count * FACE_RECT_BYTES);
+    const auto *landmarks = vectorData(result + LANDMARK_RESULT_OFFSET + 8, count * 10 * sizeof(int32_t));
+    const auto *poses = vectorData(result + POSE_RESULT_OFFSET + 8, count * VECTOR_HEADER_BYTES);
+    const auto *occlusion = vectorData(result + OCCLUSION_RESULT_OFFSET + 8, count * sizeof(int32_t));
+    const auto *probabilities = vectorData(result + FACE_PROBABILITY_RESULT_OFFSET + 8, count * sizeof(float));
+    if (!rects || !landmarks || !poses || !occlusion || !probabilities) {
+        fail(fd, request, CV_FACE_DETECTION, "Unexpected native face result layout");
+    }
+
+    const float width = static_cast<float>(request.width), height = static_cast<float>(request.height);
+    std::vector<CvFace> faces;
+    faces.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        const float probability = field<float>(probabilities, index * sizeof(float));
+        if (!std::isfinite(probability) || probability < 0.0f || probability > 1.0f) {
+            fail(fd, request, CV_FACE_DETECTION, "Invalid face probability");
+        }
+        if (probability <= 0.1f) continue;
+        const size_t rect = index * FACE_RECT_BYTES;
+        const float left = field<float>(rects, rect), top = field<float>(rects, rect + 4);
+        const float right = left + field<float>(rects, rect + 8), bottom = top + field<float>(rects, rect + 12);
+        const auto *rotation = vectorData(poses + index * VECTOR_HEADER_BYTES, 3 * sizeof(float));
+        const int32_t occluded = field<int32_t>(occlusion, index * sizeof(int32_t));
+        if (!std::isfinite(left) || !std::isfinite(top) || !std::isfinite(right) || !std::isfinite(bottom) ||
+            !rotation || (occluded != 0 && occluded != 1)) {
+            fail(fd, request, CV_FACE_DETECTION, "Invalid face geometry or occlusion result");
+        }
+        CvFace face{std::clamp(left, 0.0f, width), std::clamp(top, 0.0f, height),
+                    std::clamp(right, 0.0f, width), std::clamp(bottom, 0.0f, height), probability, {},
+                    field<float>(rotation, 0), field<float>(rotation, 4), field<float>(rotation, 8), occluded};
+        if (!std::isfinite(face.yaw) || !std::isfinite(face.pitch) || !std::isfinite(face.roll)) {
+            fail(fd, request, CV_FACE_DETECTION, "Invalid face pose");
+        }
+        if (face.right <= face.left || face.bottom <= face.top) continue;
+        const auto *points = landmarks + index * 10 * sizeof(int32_t);
+        for (size_t point = 0; point < 5; ++point) {
+            face.landmarks[point][0] = std::clamp(field<int32_t>(points, point * sizeof(int32_t)),
+                                                  0, static_cast<int32_t>(request.width - 1));
+            face.landmarks[point][1] = std::clamp(field<int32_t>(points, (point + 5) * sizeof(int32_t)),
+                                                  0, static_cast<int32_t>(request.height - 1));
+        }
+        faces.push_back(face);
+    }
+    const auto area = [](const CvFace &face) { return (face.right - face.left) * (face.bottom - face.top); };
+    std::stable_sort(faces.begin(), faces.end(), [&](const CvFace &first, const CvFace &second) {
+        return area(first) > area(second);
+    });
+    return faces;
+}
+
+[[noreturn]] void runFaces(int fd, const CvRequest &request, const char *enginePath, int64_t start,
+                           const Api &api, CVAlgo::SceneFactory *factory, const Interpreter &interpreter,
+                           const std::string &models, const std::string &cachePath, uint8_t *rgba) {
+    const Scene scene = api.createScene(factory, FACE_SCENE);
+    if (!scene || api.initScene(scene.get(), interpreter, models, cachePath, cachePath) != 0) {
+        fail(fd, request, CV_FACE_DETECTION, "Face scene initialization failed");
+    }
+    Cache cache;
+    const CacheArg args("backbone_640.ms", &cache);
+    const Cell input = imageCell(api, request, rgba, "input pixelMap");
+    if (api.runScene(scene.get(), input, args) != 0) {
+        fail(fd, request, CV_FACE_DETECTION, "Face scene submission failed");
+    }
+    alignas(16) uint8_t result[IMAGE_RESULT_SIZE];
+    waitForResult(fd, request, api, scene, result, CV_FACE_DETECTION);
+    if (cpuFailed || cpuConfigured < 6) fail(fd, request, CV_CPU_CONFIGURATION, "Missing face scene CPU models");
+    const auto faces = readFaces(fd, request, result);
+    if (request.operation == CV_FACE_EMBEDDING) {
+        if (faces.size() != 1) fail(fd, request, CV_INVALID_INPUT, "Face comparison requires one detected face per image");
+        FaceFeatures features;
+        if (!extractFaceFeatures(request, rgba, faces.front(), models, features)) {
+            fail(fd, request, CV_FACE_COMPARISON, "Face feature inference failed");
+        }
+        sendResult(fd, request, features.data(), static_cast<uint32_t>(features.size() * sizeof(float)),
+                   runtimeMetadata(fd, request, enginePath, start, ""));
+    }
+    sendResult(fd, request, faces.data(), static_cast<uint32_t>(faces.size() * sizeof(CvFace)),
+               runtimeMetadata(fd, request, enginePath, start, ""));
+}
+
 [[noreturn]] void run(int fd, const CvRequest &request, const char *enginePath,
                       const std::string &models, const std::string &cachePath) {
     const int64_t start = milliseconds();
@@ -305,6 +445,9 @@ int64_t milliseconds() {
     const auto &interpreter = *reinterpret_cast<const Interpreter *>(base + INTERPRETER_OFFSET);
     auto *factory = api.getFactory();
     if (!interpreter || !factory) fail(fd, request, CV_INCOMPATIBLE, "Missing interpreter or factory");
+    if (request.operation == CV_DETECT_FACES || request.operation == CV_FACE_EMBEDDING) {
+        runFaces(fd, request, enginePath, start, api, factory, interpreter, models, cachePath, rgba.data());
+    }
 
     Cache cache;
     const CacheArg segmentArg("backbone_640.ms", &cache);
@@ -345,30 +488,9 @@ int64_t milliseconds() {
     std::vector<uint8_t> alpha(pixels), foreground(foregroundBytes);
     render(mattingMask, request, rgba.data(), alpha, foregroundBytes ? &foreground : nullptr);
 
-    char context[128] = "unavailable";
-    cv_context(context, sizeof(context));
-    rusage usage{};
-    getrusage(RUSAGE_SELF, &usage);
-    char details[512];
-    const int length = snprintf(details, sizeof(details),
-        "pid=%d\nuid=%d\npageSize=%ld\nselinux=%s\ncpu=MS_CPU\ncpuConfigurations=%u\n"
-        "scene301Score=%.9g\nscene302Score=%.9g\nworkerMillis=%lld\nworkerPeakRssKiB=%ld\n",
-        getpid(), (int)getuid(), sysconf(_SC_PAGESIZE), context, cpuConfigured.load(),
-        segmentMask.score, mattingMask.score, static_cast<long long>(milliseconds() - start), usage.ru_maxrss);
-    if (length < 0 || static_cast<size_t>(length) >= sizeof(details)) _Exit(3);
-    const char *slash = std::strrchr(enginePath, '/');
-    if (slash == nullptr) fail(fd, request, CV_INCOMPATIBLE, "Missing installed library directory");
-    LoadedObjects loaded{std::string(enginePath, static_cast<size_t>(slash - enginePath + 1)),
-                         std::string(details, static_cast<size_t>(length))};
-    if (dl_iterate_phdr(loadedObject, &loaded) != 0) {
-        fail(fd, request, CV_INCOMPATIBLE, "Native mapping outside the installed library directory");
-    }
-    const CvResponse response{CV_MAGIC, CV_VERSION, request.id, 0, request.width, request.height,
-                              pixels, foregroundBytes, coarseBytes, static_cast<uint32_t>(loaded.metadata.size())};
-    const bool sent = cv_write(fd, &response, sizeof(response)) &&
-        cv_write(fd, loaded.metadata.data(), loaded.metadata.size()) && cv_write(fd, alpha.data(), alpha.size()) &&
-        cv_write(fd, foreground.data(), foreground.size()) && cv_write(fd, coarse.data(), coarse.size());
-    _Exit(sent ? 0 : 4);
+    char scores[128];
+    snprintf(scores, sizeof(scores), "scene301Score=%.9g\nscene302Score=%.9g\n", segmentMask.score, mattingMask.score);
+    sendResult(fd, request, alpha.data(), pixels, runtimeMetadata(fd, request, enginePath, start, scores), foreground, coarse);
 }
 }
 
@@ -380,7 +502,9 @@ int main(int argc, char **argv) {
         dup2(discard, STDERR_FILENO) < 0) return 1;
     close(discard);
     CvRequest request{};
-    if (!cv_read(STDIN_FILENO, &request, sizeof(request)) || !cv_valid(&request, CV_SEGMENT)) return 2;
+    if (!cv_read(STDIN_FILENO, &request, sizeof(request)) ||
+        (!cv_valid(&request, CV_SEGMENT) && !cv_valid(&request, CV_DETECT_FACES) &&
+         !cv_valid(&request, CV_FACE_EMBEDDING))) return 2;
     if (sysconf(_SC_PAGESIZE) != 4096) fail(protocol, request, CV_INCOMPATIBLE, "Requires 4 KiB pages");
     try {
         run(protocol, request, argv[1], argv[2], argv[3]);

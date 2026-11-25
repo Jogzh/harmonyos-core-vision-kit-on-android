@@ -65,6 +65,14 @@ Android 补充用例包括一张合成双主体图和一张纯渐变图。双主
 
 `IOTensor`、`DataCell`、`ImageResult` 及其 `SegRes` 和 `cv::Mat` 均涉及私有 ABI。探针依赖这组构建的对象布局和偏移。适配层应封装这些细节，按版本验证符号、尺寸、所有权和析构顺序。公开的 N-API 路径还依赖 Ark 运行时、`PixelMap` 和鸿蒙系统服务。现有 Ark 探针在 `InterpreterAssembly` 相关初始化阶段失败，集成从已验证的原生场景接口开始。
 
+## 人脸能力扩展
+
+Android worker 通过同一版本的 `libcobackbone.so` 调用场景 0。该场景共享 `backbone_640.ms` 和配套配置，并使用人脸检测头、关键点、姿态、人脸概率和遮挡模型。六个模型均走 DLLite 的 `MS_CPU` 后端。接入者可通过 `runtime_bundle.py prepare --include-face` 选择打包，人脸模型与抠图模型使用同一原厂 HAP 的资源版本。
+
+worker 在场景完成后检查结果向量的长度和坐标，将人脸概率大于 `0.1` 的结果按框面积降序编码。每条记录携带人脸框、五个关键点、三轴角度、人脸概率和遮挡状态。Java API 对结果长度和坐标再次校验。
+
+双图比对使用同一版 Mate 60 固件的 `hms-core-ml-clusterService-signed.hap`，SHA-256 为 `78e1d2960576e6e3e0dd444f9f6079648424400a76b47b0b8e524b7a6b30563e`。适配层取场景 0 的五个关键点，将照片对齐到 `112 × 112`，用 MindSpore Lite CPU 执行原厂 `cv_faceClusterModel_01.ms`。按同版比对服务的规则将余弦相似度映射为 `(1 + cosine) / 2`，以 `0.62` 作为判定阈值。鸿蒙公开 API 的同像素分数对照是后续验收项。
+
 ## Android 库集成
 
 `corevision-android` 使用 `com.android.library` 构建 AAR，包含自研 Android 接口、桥接和私有服务声明。`sample` 模块以普通应用身份消费该库，用于验证产物接入、原厂运行时安装和输出。宿主应用通过 Gradle 在构建时接入由使用方提供的、获准使用的原厂运行时和模型。接入说明应列出所需文件、版本、SHA-256、ABI 和宿主打包选项。

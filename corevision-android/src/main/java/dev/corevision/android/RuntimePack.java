@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -32,6 +33,8 @@ final class RuntimePack {
     private static final String ASSETS = "corevision/";
     private static final String MANIFEST = ASSETS + "runtime.sha256";
     private static final String PROFILE = ASSETS + "profile.sha256";
+    private static final String FACE_PROFILE = ASSETS + "profile-face.sha256";
+    private static final String COMPARISON_PROFILE = ASSETS + "profile-face-comparison.sha256";
     private static final Pattern LINE = Pattern.compile(
             "([0-9a-f]{64})  (lib/lib[A-Za-z0-9_.+-]+\\.so|models/[A-Za-z0-9_.-]+\\.(?:ms|bin))");
     private static final Set<String> REQUIRED_MAPPINGS = new HashSet<>(Arrays.asList("libcorevision_musl.so",
@@ -48,7 +51,7 @@ final class RuntimePack {
         this.hashes = hashes;
     }
 
-    static RuntimePack verify(Context context) throws CoreVisionException {
+    static RuntimePack verify(Context context, int operation) throws CoreVisionException {
         AssetManager assets = context.getAssets();
         try {
             byte[] manifest;
@@ -63,6 +66,12 @@ final class RuntimePack {
                 if (!hashes.entrySet().containsAll(profile.entrySet())) {
                     throw new IOException("Runtime does not match the supported ABI profile");
                 }
+            }
+            if (operation == Wire.FACE_EMBEDDING) {
+                requireModelProfile(assets, hashes, COMPARISON_PROFILE, "--face-comparison-model");
+            }
+            if (operation == Wire.DETECT_FACES || operation == Wire.FACE_EMBEDDING) {
+                requireModelProfile(assets, hashes, FACE_PROFILE, "--include-face");
             }
             File nativeDir = new File(context.getApplicationInfo().nativeLibraryDir);
             File modelDir = new File(context.getNoBackupFilesDir(), "corevision-" + hex(digest().digest(manifest)));
@@ -85,6 +94,19 @@ final class RuntimePack {
             return new RuntimePack(nativeDir, modelDir, hashes);
         } catch (IOException | ErrnoException error) {
             throw new CoreVisionException(RUNTIME_INCOMPATIBLE, error.getMessage(), error);
+        }
+    }
+
+    private static void requireModelProfile(AssetManager assets, Map<String, String> hashes, String asset, String option)
+            throws IOException, CoreVisionException {
+        try (InputStream input = assets.open(asset)) {
+            Map<String, String> profile = readManifest(new String(readManifestBytes(input), StandardCharsets.US_ASCII));
+            if (Collections.disjoint(hashes.keySet(), profile.keySet())) {
+                throw new CoreVisionException(RUNTIME_MISSING, "Prepare the runtime with " + option);
+            }
+            if (!hashes.entrySet().containsAll(profile.entrySet())) {
+                throw new IOException("Runtime does not match " + asset);
+            }
         }
     }
 

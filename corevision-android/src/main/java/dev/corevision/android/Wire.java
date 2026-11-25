@@ -13,11 +13,16 @@ final class Wire {
     static final int VERSION = 1;
     static final int PROBE = 1;
     static final int SEGMENT = 2;
+    static final int DETECT_FACES = 3;
+    static final int FACE_EMBEDDING = 4;
     static final int FOREGROUND = 1;
     static final int COARSE = 2;
     static final int MAX_DIMENSION = 8192;
     static final int MAX_PIXELS = 12_582_912;
     static final int MAX_METADATA = 32_768;
+    static final int MAX_FACES = 256;
+    static final int FACE_BYTES = 76;
+    static final int FACE_FEATURES = 256;
     static final int BUFFER_SIZE = 65_536;
     static final byte[] PROBE_INPUT = {1, 2, 4, 8, 16, 32, 64, -128, 9, 8, 7, 6, 1, 3, 5, 7};
     static final byte[] PROBE_OUTPUT = {15, -16, 0, 0};
@@ -41,40 +46,54 @@ final class Wire {
             validatePreamble(header);
             Request request = new Request(header.getInt(), header.getInt(), header.getInt(),
                     header.getInt(), header.getInt());
+            boolean validOperation = switch (request.operation) {
+                case PROBE -> request.flags == 0 && request.width == 2 && request.height == 2;
+                case SEGMENT -> (request.flags & ~(FOREGROUND | COARSE)) == 0;
+                case DETECT_FACES, FACE_EMBEDDING -> request.flags == 0;
+                default -> false;
+            };
             if (request.id == 0 || !validDimensions(request.width, request.height)
-                    || header.getInt() != request.width * 4 || header.getInt() != request.bytes()
-                    || (request.operation != PROBE && request.operation != SEGMENT)
-                    || (request.flags & ~(FOREGROUND | COARSE)) != 0
-                    || (request.operation == PROBE && (request.flags != 0 || request.width != 2 || request.height != 2))) {
+                    || header.getInt() != request.width * 4 || header.getInt() != request.bytes() || !validOperation) {
                 throw new IOException("Invalid request header");
             }
             return request;
         }
     }
 
-    record Response(int status, int width, int height, int alpha, int foreground, int coarse, int metadata) {
+    record Response(int status, int width, int height, int payload, int foreground, int coarse, int metadata) {
         static Response read(InputStream input, Request request) throws IOException {
             ByteBuffer header = littleEndian(readBytes(input, 40));
             validatePreamble(header);
             int id = header.getInt();
             Response response = new Response(header.getInt(), header.getInt(), header.getInt(),
                     header.getInt(), header.getInt(), header.getInt(), header.getInt());
-            boolean validLengths = response.status == 0
-                    ? response.width == request.width && response.height == request.height
-                        && response.alpha == request.pixels()
-                        && response.foreground == ((request.flags & FOREGROUND) != 0 ? request.bytes() : 0)
-                        && response.coarse == ((request.flags & COARSE) != 0 ? request.pixels() : 0)
-                    : response.status > 0 && response.status <= 14 && response.width == 0 && response.height == 0
-                        && response.alpha == 0 && response.foreground == 0 && response.coarse == 0;
+            boolean validLengths = response.status == 0 ? response.matches(request)
+                    : response.status > 0 && response.status <= CoreVisionException.Code.FACE_COMPARISON.value
+                        && response.width == 0 && response.height == 0
+                        && response.payload == 0 && response.foreground == 0 && response.coarse == 0;
             if (id != request.id || !validLengths || response.metadata < 0 || response.metadata > MAX_METADATA) {
                 throw new IOException("Invalid response header");
             }
             return response;
         }
 
+        private boolean matches(Request request) {
+            if (width != request.width || height != request.height) return false;
+            if (request.operation == DETECT_FACES) {
+                return payload >= 0 && payload <= FACE_BYTES * MAX_FACES && payload % FACE_BYTES == 0
+                        && foreground == 0 && coarse == 0;
+            }
+            if (request.operation == FACE_EMBEDDING) {
+                return payload == FACE_FEATURES * Float.BYTES && foreground == 0 && coarse == 0;
+            }
+            return payload == request.pixels()
+                    && foreground == ((request.flags & FOREGROUND) != 0 ? request.bytes() : 0)
+                    && coarse == ((request.flags & COARSE) != 0 ? request.pixels() : 0);
+        }
+
         void write(OutputStream output, int id, int metadataLength) throws IOException {
             output.write(buffer(40).putInt(MAGIC).putInt(VERSION).putInt(id).putInt(status)
-                    .putInt(width).putInt(height).putInt(alpha).putInt(foreground).putInt(coarse)
+                    .putInt(width).putInt(height).putInt(payload).putInt(foreground).putInt(coarse)
                     .putInt(metadataLength).array());
         }
     }
@@ -108,7 +127,7 @@ final class Wire {
         return ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN);
     }
 
-    private static ByteBuffer littleEndian(byte[] bytes) {
+    static ByteBuffer littleEndian(byte[] bytes) {
         return ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
     }
 

@@ -17,7 +17,10 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -59,19 +62,35 @@ public final class CoreVision implements AutoCloseable {
 
     private CompletableFuture<Result> segmentInternal(Bitmap bitmap, boolean includeForeground, boolean audit) {
         return submit((id, future) -> {
-            if (bitmap == null || bitmap.isRecycled() || !Wire.validDimensions(bitmap.getWidth(), bitmap.getHeight())) {
-                throw new CoreVisionException(INVALID_INPUT, "Bitmap is missing, recycled, or exceeds the supported size");
-            }
+            validateBitmap(bitmap);
             int flags = (includeForeground ? Wire.FOREGROUND : 0) | (audit ? Wire.COARSE : 0);
             Wire.Request request = new Wire.Request(id, Wire.SEGMENT, flags, bitmap.getWidth(), bitmap.getHeight());
-            return exchange(request, future, output -> writeBitmap(bitmap, output));
+            return exchange(request, future, output -> writeBitmap(bitmap, output), CoreVision::readMask);
+        });
+    }
+
+    public CompletableFuture<List<Face>> detectFaces(Bitmap bitmap) {
+        return submit((id, future) -> {
+            validateBitmap(bitmap);
+            Wire.Request request = new Wire.Request(id, Wire.DETECT_FACES, 0, bitmap.getWidth(), bitmap.getHeight());
+            return exchange(request, future, output -> writeBitmap(bitmap, output), CoreVision::readFaces);
+        });
+    }
+
+    public CompletableFuture<FaceComparison> compareFaces(Bitmap first, Bitmap second) {
+        return submit((id, future) -> {
+            validateBitmap(first);
+            validateBitmap(second);
+            float[] firstFeatures = faceFeatures(id, first, future);
+            float[] secondFeatures = faceFeatures(id, second, future);
+            return compareFeatures(firstFeatures, secondFeatures);
         });
     }
 
     public CompletableFuture<ProbeResult> probe() {
         return submit((id, future) -> {
             Wire.Request request = new Wire.Request(id, Wire.PROBE, 0, 2, 2);
-            Result result = exchange(request, future, output -> output.write(Wire.PROBE_INPUT));
+            Result result = exchange(request, future, output -> output.write(Wire.PROBE_INPUT), CoreVision::readMask);
             if (!Arrays.equals(result.alpha, Wire.PROBE_OUTPUT)) {
                 throw new CoreVisionException(PROTOCOL, "Unexpected native probe payload");
             }
@@ -89,7 +108,8 @@ public final class CoreVision implements AutoCloseable {
         });
     }
 
-    private Result exchange(Wire.Request request, CompletableFuture<?> future, PixelWriter writer)
+    private <Value> Value exchange(Wire.Request request, CompletableFuture<?> future, PixelWriter writer,
+                                   ResultReader<Value> reader)
             throws IOException, CoreVisionException, InterruptedException {
         try (Spool input = new Spool(context); Spool output = new Spool(context)) {
             try (OutputStream stream = new BufferedOutputStream(
@@ -121,13 +141,86 @@ public final class CoreVision implements AutoCloseable {
                 Wire.Response response = Wire.Response.read(stream, request);
                 String metadata = Wire.metadata(stream, response);
                 if (response.status() != 0) throw new CoreVisionException(PROTOCOL, "Unexpected worker status");
-                byte[] alpha = Wire.readBytes(stream, response.alpha());
-                Bitmap foreground = response.foreground() == 0 ? null : readForeground(stream, response);
-                byte[] coarse = response.coarse() == 0 ? null : Wire.readBytes(stream, response.coarse());
+                Value result = reader.read(stream, response, metadata);
                 if (stream.read() != -1) throw new CoreVisionException(PROTOCOL, "Unexpected extra response bytes");
-                return new Result(response.width(), response.height(), alpha, foreground, coarse, metadata);
+                return result;
             }
         }
+    }
+
+    private static void validateBitmap(Bitmap bitmap) throws CoreVisionException {
+        if (bitmap == null || bitmap.isRecycled() || !Wire.validDimensions(bitmap.getWidth(), bitmap.getHeight())) {
+            throw new CoreVisionException(INVALID_INPUT, "Bitmap is missing, recycled, or exceeds the supported size");
+        }
+    }
+
+    private static Result readMask(FileInputStream stream, Wire.Response response, String metadata) throws IOException {
+        byte[] alpha = Wire.readBytes(stream, response.payload());
+        Bitmap foreground = response.foreground() == 0 ? null : readForeground(stream, response);
+        byte[] coarse = response.coarse() == 0 ? null : Wire.readBytes(stream, response.coarse());
+        return new Result(response.width(), response.height(), alpha, foreground, coarse, metadata);
+    }
+
+    private float[] faceFeatures(int id, Bitmap bitmap, CompletableFuture<?> future)
+            throws IOException, CoreVisionException, InterruptedException {
+        if (future.isCancelled()) throw new CoreVisionException(CLOSED, "Core Vision request cancelled");
+        Wire.Request request = new Wire.Request(id, Wire.FACE_EMBEDDING, 0, bitmap.getWidth(), bitmap.getHeight());
+        return exchange(request, future, output -> writeBitmap(bitmap, output), CoreVision::readFeatures);
+    }
+
+    private static float[] readFeatures(FileInputStream stream, Wire.Response response, String metadata) throws IOException {
+        ByteBuffer buffer = Wire.littleEndian(Wire.readBytes(stream, response.payload()));
+        float[] features = new float[Wire.FACE_FEATURES];
+        for (int index = 0; index < features.length; ++index) {
+            features[index] = buffer.getFloat();
+            if (!Float.isFinite(features[index])) throw new IOException("Invalid face feature");
+        }
+        return features;
+    }
+
+    private static FaceComparison compareFeatures(float[] first, float[] second) throws CoreVisionException {
+        double dot = 0, firstNorm = 0, secondNorm = 0;
+        for (int index = 0; index < first.length; ++index) {
+            double firstValue = first[index], secondValue = second[index];
+            dot += firstValue * secondValue;
+            firstNorm += firstValue * firstValue;
+            secondNorm += secondValue * secondValue;
+        }
+        if (firstNorm <= 0 || secondNorm <= 0) {
+            throw new CoreVisionException(FACE_COMPARISON, "Empty face feature vector");
+        }
+        double similarity = Math.max(0, Math.min(1, 0.5 + 0.5 * dot / (Math.sqrt(firstNorm) * Math.sqrt(secondNorm))));
+        return new FaceComparison(similarity, similarity >= 0.62);
+    }
+
+    private static List<Face> readFaces(FileInputStream stream, Wire.Response response, String metadata) throws IOException {
+        ByteBuffer buffer = Wire.littleEndian(Wire.readBytes(stream, response.payload()));
+        List<Face> faces = new ArrayList<>(response.payload() / Wire.FACE_BYTES);
+        while (buffer.hasRemaining()) {
+            FaceBounds bounds = new FaceBounds(buffer.getFloat(), buffer.getFloat(), buffer.getFloat(), buffer.getFloat());
+            float probability = buffer.getFloat();
+            if (!(bounds.left >= 0 && bounds.top >= 0 && bounds.right <= response.width()
+                    && bounds.bottom <= response.height() && bounds.left < bounds.right && bounds.top < bounds.bottom
+                    && probability >= 0 && probability <= 1)) {
+                throw new IOException("Invalid face bounds or probability");
+            }
+            List<FacePoint> landmarks = new ArrayList<>(5);
+            for (int index = 0; index < 5; ++index) {
+                int horizontal = buffer.getInt(), vertical = buffer.getInt();
+                if (horizontal < 0 || horizontal >= response.width() || vertical < 0 || vertical >= response.height()) {
+                    throw new IOException("Invalid face landmark");
+                }
+                landmarks.add(new FacePoint(horizontal, vertical));
+            }
+            FacePose pose = new FacePose(buffer.getFloat(), buffer.getFloat(), buffer.getFloat());
+            int occluded = buffer.getInt();
+            if (!Float.isFinite(pose.yaw) || !Float.isFinite(pose.pitch) || !Float.isFinite(pose.roll)
+                    || (occluded != 0 && occluded != 1)) {
+                throw new IOException("Invalid face pose or occlusion result");
+            }
+            faces.add(new Face(bounds, probability, landmarks, pose, occluded == 1));
+        }
+        return Collections.unmodifiableList(faces);
     }
 
     private static void writeBitmap(Bitmap source, OutputStream output) throws IOException, CoreVisionException {
@@ -241,6 +334,20 @@ public final class CoreVision implements AutoCloseable {
 
     public record ProbeResult(int pid, int uid, int pageSize, String selinuxContext) {}
 
+    public record FaceBounds(float left, float top, float right, float bottom) {}
+
+    public record FacePoint(int x, int y) {}
+
+    public record FacePose(float yaw, float pitch, float roll) {}
+
+    public record FaceComparison(double similarity, boolean samePerson) {}
+
+    public record Face(FaceBounds bounds, float probability, List<FacePoint> landmarks, FacePose pose, boolean occluded) {
+        public Face {
+            landmarks = Collections.unmodifiableList(new ArrayList<>(landmarks));
+        }
+    }
+
     public static final class Result {
         private final int width;
         private final int height;
@@ -272,6 +379,10 @@ public final class CoreVision implements AutoCloseable {
 
     private interface PixelWriter {
         void write(OutputStream output) throws IOException, CoreVisionException;
+    }
+
+    private interface ResultReader<Value> {
+        Value read(FileInputStream input, Wire.Response response, String metadata) throws IOException;
     }
 
     private static final class Connection implements ServiceConnection {

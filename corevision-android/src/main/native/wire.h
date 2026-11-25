@@ -16,16 +16,23 @@ enum {
     CV_VERSION = 1,
     CV_PROBE = 1,
     CV_SEGMENT = 2,
+    CV_DETECT_FACES = 3,
+    CV_FACE_EMBEDDING = 4,
     CV_FOREGROUND = 1,
     CV_COARSE = 2,
     CV_MAX_DIMENSION = 8192,
     CV_MAX_PIXELS = 12582912,
     CV_MAX_META = 32768,
+    CV_MAX_FACES = 256,
+    CV_FACE_FEATURES = 256,
+    CV_INVALID_INPUT = 1,
     CV_INCOMPATIBLE = 4,
     CV_TIMEOUT = 6,
     CV_CPU_CONFIGURATION = 12,
     CV_SCENE_301 = 13,
     CV_SCENE_302 = 14,
+    CV_FACE_DETECTION = 15,
+    CV_FACE_COMPARISON = 16,
 };
 
 typedef struct {
@@ -33,8 +40,15 @@ typedef struct {
 } CvRequest;
 
 typedef struct {
-    uint32_t magic, version, id, status, width, height, alpha, foreground, coarse, metadata;
+    uint32_t magic, version, id, status, width, height, payload, foreground, coarse, metadata;
 } CvResponse;
+
+typedef struct {
+    float left, top, right, bottom, probability;
+    int32_t landmarks[5][2];
+    float yaw, pitch, roll;
+    int32_t occluded;
+} CvFace;
 
 static inline int cv_read(int fd, void *buffer, size_t size) {
     unsigned char *destination = (unsigned char *)buffer;
@@ -67,8 +81,9 @@ static inline int cv_valid(const CvRequest *request, uint32_t operation) {
         request->width <= CV_MAX_DIMENSION && request->height <= CV_MAX_DIMENSION &&
         pixels <= CV_MAX_PIXELS && request->stride == request->width * 4 &&
         request->bytes == pixels * 4 &&
-        (operation == CV_PROBE ? request->width == 2 && request->height == 2 && request->flags == 0
-                              : (request->flags & ~(CV_FOREGROUND | CV_COARSE)) == 0);
+        (operation == CV_SEGMENT ? (request->flags & ~(CV_FOREGROUND | CV_COARSE)) == 0
+                                : request->flags == 0) &&
+        (operation != CV_PROBE || (request->width == 2 && request->height == 2));
 }
 
 static inline int cv_watch_parent(const char *parent) {
