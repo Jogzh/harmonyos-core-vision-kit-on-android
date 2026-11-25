@@ -1,0 +1,98 @@
+# 在 Android 上运行华为原始 Core Vision Kit
+
+更新于 2026-11-24。
+
+## 结论与范围
+
+**Android 真机已在普通 ADB shell 下直接运行华为原始主体分割引擎。** 在一台未 root、SELinux 为 Enforcing 的 ARM64 手机上，独立进程使用鸿蒙 musl 加载器运行原始 `libcobackbone.so`，通过华为 DLLite 和 MindSpore Lite CPU 后端依次执行主体分割（301）和精细抠图（302）。同一输入与鸿蒙真机 `subjectSegmentation` 对照，302 的前景 IoU 为 **0.99700**（阈值 `>128`）。
+
+首期交付目标是让普通 Android APK 在本机调用这套原厂引擎和模型。Android 侧负责进程管理、像素传输和结果装配。APK 内启动方式、CPU 配置、长期资源回收以及公开 API 字段和参数的等价性属于后续交付验收项。[华为主体分割 API](https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/core-vision-subjectsegmentation-api.md)
+
+## 真机实测
+
+| 环境 | 实测条件 |
+| --- | --- |
+| 鸿蒙基线 | 华为畅享 90 Plus（`JUY-AL50`），HarmonyOS `7.0.0.111`，API `26`，`arm64-v8a`，调用公开 ArkTS API。 |
+| Android 验证 | realme `RMX5010`，Qualcomm `SM8750`，Android `17`，API `37`，`arm64-v8a`，4 KiB 页，`user` 构建。 |
+
+### 输出对照
+
+两端使用 SHA-256 一致的 `1536 × 1024` RGBA 像素。鸿蒙返回 `subjectCount = 1`、`subjectRectangle = {left: 57, top: 0, width: 1446, height: 1024}`、前景图和原尺寸 `mattingList`。Android 两个场景均返回 `512 × 512` 浮点掩码，分数均为 `0.971191`。对照时先对浮点掩码做双线性上采样，再换算到 `0–255`。
+
+| Android 输出与鸿蒙 `mattingList` 对照 | IoU（`>128`） | 阈值像素一致率 | MAE | RMSE |
+| --- | ---: | ---: | ---: | ---: |
+| 301 主体分割中间掩码 | 0.99167 | 99.510% | 1.864 | 13.081 |
+| 302 精细抠图 alpha | **0.99700** | **99.824%** | **0.591** | **4.219** |
+
+以 302 上采样后的浮点 alpha 预乘输入 RGB，再逐通道四舍五入生成 RGBA。与鸿蒙前景图比较，alpha 字节一致率为 `93.33%`，四个通道均相同的像素占 `87.50%`，全通道 MAE 为 `0.669`。同一张图重复启动 Android 探针，301 和 302 的量化掩码分别保持字节一致。
+
+Android 补充用例包括一张合成双主体图和一张纯渐变图。双主体图的 301 掩码在 `>128` 时有两个连通域，分数为 `0.946777`。纯渐变图的 301 掩码全为 `0`，302 无 `>128` 的前景像素。两项均验证至原生掩码输出，公开 API 的主体个数和空结果语义以鸿蒙基线用例验收。
+
+### 耗时与内存
+
+| 测量项 | Android 探针结果 | 口径 |
+| --- | --- | --- |
+| 新进程完成 301 和 302 | `3.37 / 3.38 / 3.40 s` | 三次独立启动，使用设备现有文件缓存，包含初始化和结果写盘。 |
+| 301 场景创建和初始化 | `2.02–2.42 s` | 来自独立的分段计时实验。 |
+| 301 提交至 302 取到结果 | `0.722 / 0.761 / 0.766 s` | 同一轮的三次样本，包含中间装配、302 初始化和结果轮询。 |
+| 同一 301 场景连续追加五次 | 每次约 `0.30 s` | 每次重置输出状态并使用新的请求缓存，探针以 100 ms 间隔轮询。 |
+| 同进程重建 301 后执行一次 | `1.122 s` | 一次观测，含销毁、创建、初始化和取到新结果。 |
+
+一组 301 连续请求中，RSS 从首个追加请求后的约 `332 MiB` 升至第五个请求后的约 `391 MiB`，清理场景后降至约 `175 MiB`。发布前需在 APK 宿主中复核对象生命周期、双场景连续调用和进程峰值内存。
+
+## 原厂产物
+
+`coBackboneService` 和 `commonHsp` 来自华为 Mate 60 `BRA-AL00` 的官方基础固件 `BRA-LGRP1-CHN 207.0.0.111(SP10)`。这两个模块与鸿蒙对照机上的 `70.19.9.308` 版本具有相同的模块 `buildHash` 和发布证书指纹。以下 SHA-256 对应本次选用的原厂文件。
+
+| 原件 | 用途 | SHA-256 |
+| --- | --- | --- |
+| `hms-core-ml-coBackboneService-signed.hap` | 引擎和 `resources/resfile/` | `afcfc5f9efb17ae872f13cd3de39f0658a58fddf5972f2b25566d4f8506da83e` |
+| `hms-core-ml-commonHsp-signed.hsp` | DLLite、OpenCV 和配套 C++ 运行时 | `ea15ce4c898389fd4fca3726d5003bc56885e738784b2f3009f522e75690d053` |
+| `libcobackbone.so` | Android 探针实际加载的华为引擎 | `f2b1037b736b1a50205d86d75bd454826e7326a8fdce91f3414d6c3b77173f56` |
+
+该 HAP 的签名配置为 `release`、分发类型为 `os_integration`，无设备 ID 白名单。两个型号上的同构建记录支持该组件随系统跨机型发行。完整 HAP 的安装和服务注册仍由目标系统的发布证书信任、系统集成权限和配套模块决定。Android 验证从原件加载 ELF 和模型资源。[OpenHarmony 应用签名配置](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/security/app-provision-structure.md)
+
+资源目录包含 `backbone_640.ms`、`head_segment_640.ms`、`salient_matting.onnx.ms` 和配套的 `cobackbone.bin`、`cobackbone_cpu.bin`、`salient_matting.onnx.bin`，合计约 `34.3 MiB`。验证使用的未裁剪装载闭包记录了 224 个共享库，约 `119 MiB`。原厂产物清单应逐文件记录来源、版本、ABI 和哈希。依据 `DT_NEEDED` 和实际装载记录减少随包文件后，重新验证启动、推理及释放。
+
+## 已验证的引擎调用链
+
+鸿蒙公开 API 经 N-API、分割客户端和 Ability IPC 到达 `CoBackboneServiceAbility`，服务日志记录了上述三个模型依次执行。Android 探针从 `libcobackbone.so` 的原生场景接口进入同一推理链，原厂引擎完成模型调度和场景级前后处理。
+
+1. 用匹配的鸿蒙运行时加载引擎，调用 `InitFeatureInterpreter()`，通过 `SceneFactory::createWithSceneId(301)` 创建场景，并以资源目录和可写缓存目录初始化。
+2. 将紧密排列的 RGBA 像素装为 `[1, H, W, 4]` 的 `IOTensor`，构造 `input pixelMap` 的 `DataCell`。用 `backbone_640.ms` 对应的缓存入口提交 301，通过 `OutputSink::Get` 取得 `SegRes`。
+3. 创建并初始化 302。其缓存输入为 `raw_image` 原图和 301 的 `SegRes`。向缓存重载传递空 `DataCell`，使用模块键 `salient_matting`。`salient_matting.onnx.ms` 是该模块加载的模型文件。
+4. 等待 302 的 `OutputSink::Get`，按掩码尺寸和行跨度复制浮点结果。异步计算结束前保留输入、缓存和中间结果的所有权。通过 IPC 返回像素字节和元数据。
+
+`IOTensor`、`DataCell`、`ImageResult` 及其 `SegRes` 和 `cv::Mat` 均涉及私有 ABI。探针依赖这组构建的对象布局和偏移。适配层应封装这些细节，按版本验证符号、尺寸、所有权和析构顺序。公开的 N-API 路径还依赖 Ark 运行时、`PixelMap` 和鸿蒙系统服务。现有 Ark 探针在 `InterpreterAssembly` 相关初始化阶段失败，集成从已验证的原生场景接口开始。
+
+## Android 集成方案
+
+```mermaid
+flowchart LR
+    APP["Android 应用"] -->|Binder| SERVICE["应用私有服务"]
+    SERVICE -->|本地 IPC| WORKER["独立 ARM64 进程 · 鸿蒙 musl"]
+    WORKER --> ENGINE["原厂 libcobackbone.so"]
+    ENGINE --> SEG["301 原厂分割"]
+    SEG --> MATTE["302 原厂抠图"]
+```
+
+**进程与打包。** Android 用 Bionic 运行应用和私有服务，由服务托管独立的 ARM64 工作进程。工作进程通过鸿蒙 musl 启动并从配套目录加载原厂运行时。首个 APK 原型验证包管理器安装的可执行路径、普通应用 UID 和 Enforcing 策略下的启动能力。模型从可读位置加载，缓存和临时输出写入应用数据目录。首期设备矩阵以 4 KiB 页 ARM64 为起点，16 KiB 页单独检验加载器和全量原生依赖的段对齐与装载。鸿蒙系统侧 `std::__h` 与 HAP/HSP 侧 `std::__n1` 分别使用匹配的 C++ 运行时，跨进程接口只传字节和基础类型。[Android 可执行文件限制](https://developer.android.com/about/versions/10/behavior-changes-10#execute-permission) · [Android 16 KiB 页支持](https://developer.android.com/guide/practices/page-sizes)
+
+**CPU 配置。** 探针初期进入 MindSpore C 后端时，DLLite 的设备列表为空，创建模型 wrapper 失败。成功轮次由验证用符号适配调用 DLLite 的 `SetCommonDevice` 设置 `MS_CPU`，再由原厂后端执行。生产优先采用受支持的 CPU 配置入口。若需要通过私有 ABI 接入，则把 CPU 设置放到独立的版本化适配层，在模型打开前配置 DLLite 原有 CPU 后端。校验构建哈希与 ABI，覆盖配置失败、对象生命周期和版本拒绝。运行时兼容还需验证 `pthread_cond_clockwait` 对所用时钟和超时的处理。
+
+**协议与生命周期。** 应用侧以 Binder 文件描述符传递像素缓冲区，私有服务与工作进程先采用有长度上限的本地管道协议。请求包含协议版本、请求 ID、宽高、行跨度和像素格式。校验尺寸和总字节数后按需整理为紧密 RGBA。响应包含对应请求 ID、状态、掩码尺寸与格式、alpha 和前景数据。首版使用每请求独立进程作为正确性基线。常驻方案在证明复用安全后串行处理请求，设定时限和内存预算，覆盖超时退出、崩溃后重启和资源回收。
+
+**API 映射。** 302 的浮点 alpha 按原图尺寸上采样后量化，可作为 `mattingList` 的装配输入。预乘 alpha 合成的 RGBA 对应 `fullSubject.foregroundImage`。`subjectRectangle`、`subjectCount`、`subjectDetails` 与 `maxCount` 需以鸿蒙公开 API 的输出校准。单样本中，301 阈值掩码按比例映射的框为 `{left: 60, top: 10, width: 1440, height: 1014}`，公开 API 返回了不同的主体框。兼容层应以实测返回结构确定坐标、排序、筛选与空结果规则。
+
+## 交付验收
+
+| 阶段 | 通过条件 |
+| --- | --- |
+| 原厂引擎验证（完成） | 在 Android 真机上加载指定哈希的原厂引擎和资源，取得 301、302 掩码，与鸿蒙同像素基线完成对照。 |
+| APK 宿主验证 | 普通应用 UID 下启动工作进程，保持 SELinux Enforcing，在断网状态提交新图并取得两段原厂引擎结果。启动诊断能定位不兼容的运行时、ABI、页大小或 CPU 配置。 |
+| 输出语义验收 | 同像素对照单主体、多主体、无主体及参数异常用例。核对 alpha、前景图、主体框、主体数及错误码。跨设备容差以基线重复测量为依据。 |
+| 资源与适配验收 | 记录 APK 的冷启动、连续调用时延分布与峰值内存，验证释放、重启和版本不匹配行为，再确定支持的机型、页大小和运行时组合。 |
+
+## 开源与复现
+
+公开仓库用于发布自研桥接、协议、验证工具、合成样例和可公开的验证数据。原厂 HAP/HSP、系统库及模型由具备使用授权的测试者在本地提供，验证流程按清单校验哈希。随 APK 分发这些文件需要单独确认对应的再分发权利。公开复现记录使用通用参数和合成样本，原始设备连接信息、调试日志及本地实验配置保留在测试环境中。
