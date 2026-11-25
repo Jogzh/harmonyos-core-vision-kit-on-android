@@ -1,0 +1,61 @@
+plugins {
+    id 'com.android.library'
+    id 'maven-publish'
+}
+
+android {
+    namespace 'dev.corevision.android'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        minSdk 26
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    buildFeatures { aidl true }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    publishing { singleVariant('release') { withSourcesJar() } }
+}
+
+def ndk = androidComponents.sdkComponents.sdkDirectory.map { it.dir("ndk/${android.ndkVersion}") }
+def ohosSdk = providers.environmentVariable('OHOS_NATIVE_SDK').orElse('')
+def workers = tasks.register('buildNativeWorkers', Exec) {
+    def builder = rootProject.file('tools/build_workers.sh')
+    def sources = file('src/main/native')
+    def destination = layout.buildDirectory.dir('workers')
+    inputs.file(builder)
+    inputs.dir(sources)
+    inputs.property('ndkVersion', android.ndkVersion)
+    inputs.property('ohosSdk', ohosSdk)
+    outputs.dir(destination)
+    doFirst {
+        commandLine 'bash', builder, sources, destination.get().asFile, ndk.get().asFile, ohosSdk.get()
+    }
+}
+android.sourceSets.main.jniLibs.srcDir(layout.buildDirectory.dir('workers'))
+tasks.named('preBuild').configure { dependsOn workers }
+
+publishing {
+    repositories {
+        maven {
+            name = 'localDistribution'
+            url = rootProject.layout.buildDirectory.dir('maven').get().asFile.toURI()
+        }
+    }
+    publications {
+        register('release', MavenPublication) {
+            groupId = 'dev.corevision'
+            artifactId = 'corevision-android'
+            version = rootProject.corevisionVersion
+            pom {
+                name = 'Core Vision Kit Android Bridge'
+                description = 'Android API and ARM64 process bridge for a separately supplied runtime.'
+            }
+            afterEvaluate { from components.release }
+        }
+    }
+}

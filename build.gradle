@@ -1,0 +1,15 @@
+plugins {
+    id 'com.android.library' version '8.7.2' apply false
+    id 'com.android.application' version '8.7.2' apply false
+}
+
+ext.corevisionVersion = '0.1.0'
+
+tasks.register('mavenZip', Zip) {
+    dependsOn ':corevision-android:publishReleasePublicationToLocalDistributionRepository'
+    from(layout.buildDirectory.dir('maven')) { into 'maven' }
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+    archiveFileName = "corevision-android-${corevisionVersion}-maven.zip"
+    reproducibleFileOrder = true
+    preserveFileTimestamps = false
+}
