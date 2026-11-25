@@ -18,7 +18,6 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -33,10 +32,15 @@ final class RuntimePack {
     private static final String ASSETS = "corevision/";
     private static final String MANIFEST = ASSETS + "runtime.sha256";
     private static final String PROFILE = ASSETS + "profile.sha256";
+    private static final String OBJECT_PROFILE = ASSETS + "profile-object.sha256";
     private static final String FACE_PROFILE = ASSETS + "profile-face.sha256";
+    private static final String SKELETON_PROFILE = ASSETS + "profile-skeleton.sha256";
     private static final String COMPARISON_PROFILE = ASSETS + "profile-face-comparison.sha256";
+    private static final String SR_PROFILE = ASSETS + "profile-super-resolution.sha256";
+    private static final String OCR_PROFILE = ASSETS + "profile-text-recognition.sha256";
+    private static final String SEARCH_PROFILE = ASSETS + "profile-image-search.sha256";
     private static final Pattern LINE = Pattern.compile(
-            "([0-9a-f]{64})  (lib/lib[A-Za-z0-9_.+-]+\\.so|models/[A-Za-z0-9_.-]+\\.(?:ms|bin))");
+            "([0-9a-f]{64})  (lib/lib[A-Za-z0-9_.+-]+\\.so|models/[A-Za-z0-9_.-]+\\.(?:ms|bin|json))");
     private static final Set<String> REQUIRED_MAPPINGS = new HashSet<>(Arrays.asList("libcorevision_musl.so",
             "libcobackbone.so", "libdlliteclient.so", "libdlliteclient_mindspore_c.so", "libmindspore_lite_ndk.so",
             "libc++_shared.so"));
@@ -68,10 +72,26 @@ final class RuntimePack {
                 }
             }
             if (operation == Wire.FACE_EMBEDDING) {
-                requireModelProfile(assets, hashes, COMPARISON_PROFILE, "--face-comparison-model");
+                requireProfile(assets, hashes, COMPARISON_PROFILE, "--face-comparison-model");
             }
-            if (operation == Wire.DETECT_FACES || operation == Wire.FACE_EMBEDDING) {
-                requireModelProfile(assets, hashes, FACE_PROFILE, "--include-face");
+            if (operation == Wire.DETECT_SKELETONS) {
+                requireProfile(assets, hashes, SKELETON_PROFILE, "--include-skeleton");
+            }
+            if (operation == Wire.DETECT_FACES || operation == Wire.FACE_EMBEDDING || operation == Wire.DETECT_SKELETONS) {
+                requireProfile(assets, hashes, FACE_PROFILE, "--include-face");
+            }
+            if (operation == Wire.DETECT_OBJECTS || operation == Wire.DETECT_FACES
+                    || operation == Wire.FACE_EMBEDDING || operation == Wire.DETECT_SKELETONS) {
+                requireProfile(assets, hashes, OBJECT_PROFILE, "--include-objects");
+            }
+            if (operation == Wire.SUPER_RESOLUTION) {
+                requireProfile(assets, hashes, SR_PROFILE, "--super-resolution-models");
+            }
+            if (operation == Wire.RECOGNIZE_TEXT) {
+                requireProfile(assets, hashes, OCR_PROFILE, "--text-recognition-models");
+            }
+            if (operation == Wire.IMAGE_FEATURES || operation == Wire.TEXT_FEATURES) {
+                requireProfile(assets, hashes, SEARCH_PROFILE, "--image-search-service");
             }
             File nativeDir = new File(context.getApplicationInfo().nativeLibraryDir);
             File modelDir = new File(context.getNoBackupFilesDir(), "corevision-" + hex(digest().digest(manifest)));
@@ -97,11 +117,11 @@ final class RuntimePack {
         }
     }
 
-    private static void requireModelProfile(AssetManager assets, Map<String, String> hashes, String asset, String option)
+    private static void requireProfile(AssetManager assets, Map<String, String> hashes, String asset, String option)
             throws IOException, CoreVisionException {
         try (InputStream input = assets.open(asset)) {
             Map<String, String> profile = readManifest(new String(readManifestBytes(input), StandardCharsets.US_ASCII));
-            if (Collections.disjoint(hashes.keySet(), profile.keySet())) {
+            if (!hashes.keySet().containsAll(profile.keySet())) {
                 throw new CoreVisionException(RUNTIME_MISSING, "Prepare the runtime with " + option);
             }
             if (!hashes.entrySet().containsAll(profile.entrySet())) {

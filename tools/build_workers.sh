@@ -42,4 +42,5 @@ target=(--target=aarch64-linux-ohos --sysroot="$ohos_sdk/sysroot" -fuse-ld=lld)
     -I"$work/include" -fPIE -pie -nostdlib++ -ffp-contract=off \
     -Wl,-E,--dynamic-linker=/lib/ld-musl-aarch64.so.1 "${page_size_flags[@]}" \
     -Wl,--no-as-needed,"$work/libc++_shared.so",--as-needed,--unresolved-symbols=ignore-all \
-    "$sources/engine.cpp" "$sources/face_feature.cpp" -o "$output/arm64-v8a/libcorevision_worker.so"
+    "$sources/engine.cpp" "$sources/face_feature.cpp" "$sources/ocr_bridge.cpp" "$sources/text_feature.cpp" \
+    -o "$output/arm64-v8a/libcorevision_worker.so"

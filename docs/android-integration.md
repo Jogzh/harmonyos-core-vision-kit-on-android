@@ -57,14 +57,26 @@ python3 tools/runtime_bundle.py verify "$COREVISION_RUNTIME_DIR"
 
 `COREVISION_RUNTIME_DIR` 取仓库以外的新目录。已有审计阶段的加载器可填写 `image-musl-loader`，库目录可用已经平铺的 `libs/`。musl 本身提供 `libc.so`，把这个文件从平铺目录中省略。模型侧使用三个 `.ms` 和三个 `.bin`。脚本生成宿主 `jniLibs`、`assets` 和全量哈希清单。应用验证已安装 ELF 和模型哈希，将模型放进私有目录，再启动 worker。原厂文件和本地验收输出由接入方留存。
 
-启用人脸检测时，将 `--include-face` 加到 `prepare` 命令并指向同一版原厂 HAP 的完整 `resources/resfile`。此选项校验并加入检测头、关键点、姿态、人脸概率和遮挡相关的九个文件。[人脸检测模型清单](../corevision-android/src/main/assets/corevision/profile-face.sha256)
+`--models` 指向同版本 `coBackboneService` 的 `resources/resfile`。可按需要组合以下参数。
 
-启用双图人脸比对时，从 `hms-core-ml-clusterService-signed.hap` 的 `resources/resfile` 准备 `cv_faceClusterModel_01.ms`，将本地路径传给 `--face-comparison-model`。此选项同时加入检测所需模型。[比对模型清单](../corevision-android/src/main/assets/corevision/profile-face-comparison.sha256) · [原厂组件版本](technical-proposal.md#人脸能力扩展)
+| 能力 | `prepare` 参数与来源 |
+| --- | --- |
+| 物体检测 | `--include-objects` 加入 `head_detect_640.ms` |
+| 人脸检测 | `--include-face` 加入检测头、关键点、姿态、人脸概率和遮挡模型 |
+| 人脸比对 | `--face-comparison-model "$FACE_COMPARISON_MODEL"` 传入 `clusterService` 的 `cv_faceClusterModel_01.ms`，同时启用人脸检测 |
+| 骨骼检测 | `--include-skeleton` 加入骨骼模型及其依赖的共享检测模型 |
+| 图像超分 | `--super-resolution-models "$SR_RESFILE"` 指向 `imageSRService/resources/resfile`，并把该 HAP 的 `libimagesuperresolution.so` 和匹配的 `libimage_source_ndk.z.so` 加入 `--libs` |
+| 文字识别 | `--text-recognition-models "$OCR_RAWFILE"` 指向 `textService/resources/rawfile`，并把同一 HAP 的 `liblite_common_ocr.so`、`libtext-clustering.so` 加入 `--libs` |
+| 以文搜图 | `--image-search-service "$LABEL_SERVICE"` 指向解包后的 `labelService` 根目录。脚本从 `resources/resfile/image_retrieval_text.ms` 与 `libs/arm64-v8a/liblabel_detect.so` 取得文本模型和词表，并从 `--models` 取得两个视觉检测头 |
+
+各能力的版本以 [SHA-256 清单](../corevision-android/src/main/assets/corevision/) 为准。以文搜图词表对应 `labelService` 的旧版 256 维模型。脚本校验词表来源及提取结果。[原厂组件与调用链](technical-proposal.md)
 
 ```sh
 python3 tools/runtime_bundle.py prepare \
   --loader "$MUSL_LOADER" --libs "$ARM64_LIBS" --models "$RESFILE" \
-  --face-comparison-model "$FACE_COMPARISON_MODEL" --output "$COREVISION_RUNTIME_DIR"
+  --include-skeleton --face-comparison-model "$FACE_COMPARISON_MODEL" \
+  --super-resolution-models "$SR_RESFILE" --text-recognition-models "$OCR_RAWFILE" \
+  --image-search-service "$LABEL_SERVICE" --output "$COREVISION_RUNTIME_DIR"
 ```
 
 ## 调用 API
@@ -78,12 +90,30 @@ coreVision.segment(bitmap, true).whenComplete { result, error ->
 }
 ```
 
-- `segment(bitmap)` 默认只返回 alpha。`segment(bitmap, true)` 同时生成前景 `Bitmap`。
+- `segment(bitmap)` 返回合并 alpha、主体数和边界。`segment(bitmap, true)` 同时生成前景 `Bitmap`。
 - `result.alpha` 按行紧密排列，每像素一个字节。Java 和 Kotlin 读取无符号值时使用 `alpha[index].toInt() and 0xff` 或 `Byte.toUnsignedInt(alpha[index])`。
 - 输出前景的 alpha 等于 302 蒙版，RGB 由原图的 sRGB 通道乘以浮点覆盖率得到。两种输出的像素尺寸均与输入一致。
 - 输入在后台转成紧密 RGBA。调用期间保持 `Bitmap` 可读。输入限制为单边 8192 像素且总像素不超过 12,582,912。
 - `CoreVision` 可在连续请求间复用。会话内串行执行，允许一个排队请求。用完调用 `close()` 取消待处理请求并通知服务终止活动 worker。
 - `CompletableFuture` 通过 `CoreVisionException` 报告失败。在 `get()` 或 `join()` 的异常原因中读取 `code`，可识别版本不匹配、运行时缺失、设备不支持、超时、CPU 配置失败及场景失败。
+
+### 主体明细
+
+```kotlin
+val options = CoreVision.SegmentationOptions(6, true, true)
+coreVision.segment(bitmap, options).thenAccept { result ->
+    val bounds = result.subjectBounds
+    for (subject in result.subjectDetails) {
+        val boundsOfSubject = subject.bounds
+        val mask = subject.alpha
+    }
+}
+```
+
+- `maxCount` 接受 `1–20`。普通重载默认 `6`，主体明细默认关闭。上限影响计数和明细，合并蒙版保留完整的 302 输出。
+- 单主体按 302 蒙版中 alpha `>128` 的八连通区域面积降序排列。面积小于原生蒙版 `0.1%` 或少于四个像素的区域会被忽略。相连主体会合并为同一区域，纯色图的主体数为零。
+- 边界使用输入图像像素坐标，以 `left`、`top`、`width`、`height` 表示。存在主体时，合并边界依据非零 alpha 计算。无主体时边界为空。
+- `Subject.getAlpha()` 和 `getForeground()` 按需创建原图尺寸的单主体输出。关闭前景选项时返回 `null` 前景。主体明细的区域划分由适配层完成。
 
 ### 人脸检测
 
@@ -102,6 +132,7 @@ coreVision.detectFaces(bitmap).thenAccept { faces ->
 - `bounds()` 是输入 `Bitmap` 像素坐标系中的 `left`、`top`、`right`、`bottom`。右边界和下边界是矩形外边缘。多张人脸按可见框面积降序排列。
 - `landmarks()` 依次给出左眼、右眼、鼻尖、左嘴角和右嘴角。`pose()` 返回以度为单位的 `yaw`、`pitch`、`roll`。`occluded()` 返回原厂遮挡检测结果。
 - `probability()` 是原厂模型输出的人脸概率，范围为 `0–1`。没有检测到人脸时返回空列表。
+- Android 的人脸场景始终返回遮挡字段。鸿蒙在初始化时提供独立的 `faceBlock` 开关。
 - 仅打包抠图模型时，`detectFaces()` 返回 `RUNTIME_MISSING`。模型哈希与清单不一致时返回 `RUNTIME_INCOMPATIBLE`。原厂人脸场景失败时返回 `FACE_DETECTION`、`CPU_CONFIGURATION` 或 `TIMEOUT` 等对应错误。
 
 ### 双图人脸比对
@@ -117,6 +148,35 @@ coreVision.compareFaces(firstBitmap, secondBitmap).thenAccept { result ->
 
 - 比对复用会话的串行队列，每张图分别运行一次工作进程。原厂模型的特征只在请求内用于计算相似度。
 - 任一图片检测到零张或多张人脸时返回 `INVALID_INPUT`。缺少比对模型时返回 `RUNTIME_MISSING`，特征推理失败时返回 `FACE_COMPARISON`。
+
+### 物体、骨骼、OCR 和超分
+
+| Android 方法 | 输出 |
+| --- | --- |
+| `detectObjects(bitmap)` | 输入图像像素坐标中的外接框、`0–1` 得分、类别和从零开始的图内 ID。所用场景每个物体返回一个类别，`labels()` 返回单元素列表 |
+| `detectSkeletons(bitmap)` | 骨骼框、得分及 17 个按 `SkeletonPointType` 排列的关键点，关键点包含坐标和得分 |
+| `recognizeText(bitmap, detectDirection)` | 原厂识别文本、块、行、词及四角坐标。省略第二个参数时开启方向检测。`getSupportedTextLanguages()` 返回该模型声明的语言列表 |
+| `superResolve(bitmap)` | 宽高各为输入 4 倍的 `ARGB_8888` 位图，输出 alpha 为 `255`。输入单边最多 `2048` 像素且总像素最多 `786,432` |
+
+检测无结果时返回空列表，OCR 无结果时返回空字符串和空块列表。模型未打包时，对应推理调用报告 `RUNTIME_MISSING`。
+
+### 以文搜图
+
+```kotlin
+coreVision.insertImage("photo-123", "Gallery", bitmap)
+    .thenCompose { coreVision.searchImages("宇航员", "Gallery", 10) }
+    .thenAccept { results ->
+        for (match in results) {
+            val id = match.imageId()
+            val similarity = match.similarity()
+        }
+    }
+```
+
+- `insertImage(imageId, scope, bitmap)` 使用宿主提供的图片 ID。宿主保留 ID 与图片 URI 或路径的映射。相同 `(scope, imageId)` 再次写入时覆盖向量。
+- `scope` 接受 `1–32` 位 ASCII 字母或数字，ID 长度为 `1–128`，查询长度为 `1–100`。`topKey` 为 `0–100`，默认 `100`。
+- `searchImages()` 在当前分区内按余弦相似度降序返回最多 `topKey` 条记录，包括低相似度条目。相似度范围是 `[-1, 1]`，词表以中文为主。
+- 索引在同一个应用的会话之间持久化，保存在应用私有目录，记录分区、ID 和归一化特征。`deleteImage()` 只移除指定索引项。`clearImageSearch()` 清空应用的所有索引分区。
 
 ## 构建及复测
 
@@ -153,13 +213,24 @@ python3 tools/device_acceptance.py --face-input /tmp/corevision-face.rgba \
   --width "$FACE_WIDTH" --height "$FACE_HEIGHT" --face-count "$FACE_COUNT"
 ```
 
-使用仅含抠图模型的 APK 时，可运行 `python3 tools/device_acceptance.py --expect-face-models-missing` 检查可选模型缺失的行为。
+使用仅含抠图模型的 APK 时，运行 `python3 tools/device_acceptance.py --expect-face-models-missing` 检查所有可选推理接口的模型缺失行为。
 
 验证比对时使用包含特征模型的 APK。验收脚本接收两张等尺寸的 RGBA 样本，并额外用一张纯色图检查错误路径。对同一人和不同人各运行一次，分别指定 `--expect-match yes` 和 `--expect-match no`。
 
 ```sh
 python3 tools/device_acceptance.py --compare-input "$FIRST_RGBA" "$SECOND_RGBA" \
   --width "$FACE_WIDTH" --height "$FACE_HEIGHT" --expect-match yes
+```
+
+新增能力可使用以下参数复测。每个命令的宽高按输入测试图填写。搜索用例需要同尺寸的宇航员和猫照片。
+
+```sh
+python3 tools/device_acceptance.py --subject-input "$MULTI_SUBJECT_RGBA" --subject-count 2 --width 1536 --height 1024
+python3 tools/device_acceptance.py --object-input "$ASTRONAUT_RGBA" --object-label 13 --width 512 --height 512
+python3 tools/device_acceptance.py --skeleton-input "$ASTRONAUT_RGBA" --skeleton-count 1 --width 512 --height 512
+python3 tools/device_acceptance.py --ocr-input "$TEXT_RGBA" --expected-text 'CORE VISION' --width 640 --height 360
+python3 tools/device_acceptance.py --super-resolution-input "$TEXTURED_RGBA" --width 128 --height 128
+python3 tools/device_acceptance.py --search-input "$ASTRONAUT_RGBA" "$CAT_RGBA" --width 512 --height 512
 ```
 
 两份自研 ELF 的 LOAD 段采用 16 KiB 对齐，原厂 ELF 使用 4 KiB 对齐。部分 Android 系统会在打开含原厂文件的调试 APK 时提示兼容性。以 `adb -s "$ANDROID_SERIAL" shell getconf PAGE_SIZE` 的实际页大小为准，返回 `4096` 时可点「确定」继续测试。手动测试可用相同的 `corevisionRuntimeDir` 运行 `:sample:assembleRelease`，再给生成的 release APK 签名并安装。
@@ -196,3 +267,17 @@ python3 tools/device_acceptance.py --baseline "$HARMONY_BASELINE_DIR" --worker-f
 断网的 API 35 ARM64 模拟器使用本轮构建的本地 Maven AAR，通过了单脸、双脸和纯色图检测用例。双图比对中，同一照片的变换样本相似度为 `0.99631`，不同人照片为 `0.51802`。示例通过了不同尺寸照片的选图和双图预览，无脸或多脸的比对输入返回 `INVALID_INPUT`，仅打包抠图模型时两个人脸接口返回 `RUNTIME_MISSING`。
 
 包含全部人脸模型的 APK 重跑同一抠图基线，301 和 302 的 IoU 分别为 `0.99166` 和 `0.99700`，预乘前景 RGBA MAE 为 `0.66908`。
+
+### 全量离线验收
+
+使用本地 Maven 发布包和全量运行时，在断网的 Android API 35 ARM64 模拟器完成以下验收。合并抠图基线的 301 与 302 IoU 分别为 `0.99166` 和 `0.99700`。
+
+| 能力 | 验收用例 |
+| --- | --- |
+| 主体分割 | 双主体面积排序，独立的蒙版和前景，`maxCount=1` 时合并蒙版一致，纯色图为零主体 |
+| 物体和骨骼检测 | 宇航员图识别出人物类别和带 17 个关键点的骨骼，纯色图返回空结果 |
+| 文字识别 | 普通与倒置文字、含多行的文字块、行和词坐标、空白图 |
+| 图像超分 | `128 × 128 → 512 × 512`，`17 × 9 → 68 × 36`，输出 alpha 为 `255` |
+| 以文搜图 | 「宇航员」「猫咪」各自排对，另测 `topKey`、分区隔离、会话间持久化、删除和清空 |
+
+以上新增能力及主体明细的结果来自 Android 插桩。鸿蒙侧已对照的基线为原有的合并蒙版和前景图。

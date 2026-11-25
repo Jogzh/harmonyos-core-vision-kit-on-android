@@ -13,13 +13,22 @@ from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE = ROOT / "corevision-android/src/main/assets/corevision/profile.sha256"
+OBJECT_PROFILE = PROFILE.with_name("profile-object.sha256")
 FACE_PROFILE = PROFILE.with_name("profile-face.sha256")
+SKELETON_PROFILE = PROFILE.with_name("profile-skeleton.sha256")
 COMPARISON_PROFILE = PROFILE.with_name("profile-face-comparison.sha256")
+SR_PROFILE = PROFILE.with_name("profile-super-resolution.sha256")
+OCR_PROFILE = PROFILE.with_name("profile-text-recognition.sha256")
+SEARCH_PROFILE = PROFILE.with_name("profile-image-search.sha256")
+PROFILES = (PROFILE, OBJECT_PROFILE, FACE_PROFILE, SKELETON_PROFILE, COMPARISON_PROFILE, SR_PROFILE, OCR_PROFILE, SEARCH_PROFILE)
 MANIFEST = "assets/corevision/runtime.sha256"
 LOADER = "libcorevision_musl.so"
 BRIDGES = {"libcorevision_probe.so", "libcorevision_worker.so"}
 LIBRARY = re.compile(r"lib[A-Za-z0-9_.+-]+\.so")
-LINE = re.compile(r"([0-9a-f]{64})  (lib/lib[A-Za-z0-9_.+-]+\.so|models/[A-Za-z0-9_.-]+\.(?:ms|bin))")
+LINE = re.compile(r"([0-9a-f]{64})  (lib/lib[A-Za-z0-9_.+-]+\.so|models/[A-Za-z0-9_.-]+\.(?:ms|bin|json))")
+SEARCH_VOCAB_LIBRARY_SHA = "9d651b13966dfc92cc046ef9537672dd7b625993b2bc66a9743b336027ba9f83"
+SEARCH_VOCAB_SLICES = ((0x25F8B, 323), (0x893DF, 183_425))
+SEARCH_VOCAB = "models/image_retrieval_vocab.json"
 
 
 def checksum(stream):
@@ -43,13 +52,27 @@ def parse_manifest(contents):
 
 def verify_pin_hashes(entries):
     required = parse_manifest(PROFILE.read_bytes())
+    objects = parse_manifest(OBJECT_PROFILE.read_bytes())
     face = parse_manifest(FACE_PROFILE.read_bytes())
+    skeleton = parse_manifest(SKELETON_PROFILE.read_bytes())
     comparison = parse_manifest(COMPARISON_PROFILE.read_bytes())
-    if comparison.keys() & entries.keys():
+    include_comparison = not comparison.keys().isdisjoint(entries)
+    include_skeleton = "models/head_skeleton.ms" in entries
+    include_face = include_comparison or include_skeleton or not face.keys().isdisjoint(entries)
+    if include_face or not objects.keys().isdisjoint(entries):
+        required.update(objects)
+    if include_face:
+        required.update(face)
+    if include_skeleton:
+        required.update(skeleton)
+    if include_comparison:
         required.update(comparison)
-        required.update(face)
-    elif face.keys() & entries.keys():
-        required.update(face)
+    for profile, library in ((SR_PROFILE, "libimagesuperresolution.so"), (OCR_PROFILE, "liblite_common_ocr.so")):
+        optional = parse_manifest(profile.read_bytes())
+        if any(path.startswith("models/") and path in entries for path in optional) or f"lib/{library}" in entries:
+            required.update(optional)
+    if "models/image_retrieval_text.ms" in entries or SEARCH_VOCAB in entries:
+        required.update(parse_manifest(SEARCH_PROFILE.read_bytes()))
     for path, expected in required.items():
         if entries.get(path) != expected:
             raise ValueError(f"Unsupported or missing runtime file {path}")
@@ -91,6 +114,16 @@ def assert_bridge_elf(stream, name):
         raise ValueError(f"No ELF LOAD segments for {name}")
 
 
+def extract_search_vocab(service, output):
+    library = service / "libs/arm64-v8a/liblabel_detect.so"
+    with library.open("rb") as content, output.open("wb") as vocab:
+        if checksum(content) != SEARCH_VOCAB_LIBRARY_SHA:
+            raise ValueError("Unsupported labelService vocabulary source liblabel_detect.so")
+        for offset, length in SEARCH_VOCAB_SLICES:
+            content.seek(offset)
+            vocab.write(content.read(length))
+
+
 def prepare(args):
     output = args.output.resolve()
     if output == ROOT or ROOT in output.parents:
@@ -103,16 +136,37 @@ def prepare(args):
         if not path.is_file() or not LIBRARY.fullmatch(path.name) or path.name == "libc.so" or path.name.startswith("libcorevision_"):
             raise ValueError(f"Unexpected entry in the flat runtime library directory: {path.name}")
         sources[f"lib/{path.name}"] = path
-    profiles = (PROFILE, FACE_PROFILE) if args.include_face or args.face_comparison_model else (PROFILE,)
+    include_face = args.include_face or args.face_comparison_model or args.include_skeleton
+    profiles = [PROFILE]
+    if args.include_objects or include_face:
+        profiles.append(OBJECT_PROFILE)
+    if include_face:
+        profiles.append(FACE_PROFILE)
+    if args.include_skeleton:
+        profiles.append(SKELETON_PROFILE)
     for relative in (path for profile in profiles for path in parse_manifest(profile.read_bytes())):
         if relative.startswith("models/"):
             sources[relative] = args.models / relative.split("/", 1)[1]
     if args.face_comparison_model is not None:
         for relative in parse_manifest(COMPARISON_PROFILE.read_bytes()):
             sources[relative] = args.face_comparison_model
+    for profile, model_dir in ((SR_PROFILE, args.super_resolution_models), (OCR_PROFILE, args.text_recognition_models)):
+        if model_dir is None:
+            continue
+        for relative in parse_manifest(profile.read_bytes()):
+            if relative.startswith("models/"):
+                sources[relative] = model_dir / relative.split("/", 1)[1]
 
     with tempfile.TemporaryDirectory(prefix=".corevision-runtime-", dir=output.parent) as temporary:
         draft = Path(temporary) / "bundle"
+        if args.image_search_service is not None:
+            service = args.image_search_service
+            sources["models/image_retrieval_text.ms"] = service / "resources/resfile/image_retrieval_text.ms"
+            for name in ("head_label_classify_640.ms", "head_retrieval_640.ms"):
+                sources[f"models/{name}"] = args.models / name
+            vocabulary = Path(temporary) / "image_retrieval_vocab.json"
+            extract_search_vocab(service, vocabulary)
+            sources[SEARCH_VOCAB] = vocabulary
         checksums = {}
         for relative, origin in sorted(sources.items()):
             destination = bundle_path(draft, relative)
@@ -168,8 +222,7 @@ def verify_apk(bundle, apk):
 def verify_aar(aar):
     with ZipFile(aar) as archive:
         names = {name for name in archive.namelist() if not name.endswith("/")}
-        profiles = {f"assets/corevision/{profile.name}": profile
-                    for profile in (PROFILE, FACE_PROFILE, COMPARISON_PROFILE)}
+        profiles = {f"assets/corevision/{profile.name}": profile for profile in PROFILES}
         required = {"AndroidManifest.xml", "classes.jar", *profiles}
         expected = {f"jni/arm64-v8a/{name}" for name in BRIDGES}
         if not required <= names or names & {MANIFEST} or {name for name in names if name.startswith("jni/")} != expected:
@@ -192,7 +245,12 @@ def main():
     for argument in ("loader", "libs", "models", "output"):
         create.add_argument(f"--{argument}", required=True, type=Path)
     create.add_argument("--include-face", action="store_true", help="also include the verified face detection models")
+    create.add_argument("--include-objects", action="store_true", help="also include the verified object detection head")
+    create.add_argument("--include-skeleton", action="store_true", help="also include skeleton and shared detection models")
     create.add_argument("--face-comparison-model", type=Path, help="include the original face comparison model and face detection")
+    create.add_argument("--super-resolution-models", type=Path, help="include verified models from imageSRService resources/resfile")
+    create.add_argument("--text-recognition-models", type=Path, help="include verified models from textService resources/rawfile")
+    create.add_argument("--image-search-service", type=Path, help="include image search using an extracted labelService directory")
     commands.add_parser("verify").add_argument("bundle", type=Path)
     apk = commands.add_parser("verify-apk")
     apk.add_argument("bundle", type=Path)

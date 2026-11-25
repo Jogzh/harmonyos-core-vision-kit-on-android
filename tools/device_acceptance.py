@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import struct
 import subprocess
 import sys
@@ -16,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = "dev.corevision.sample"
 RUNNER = f"{APP}.test/dev.corevision.android.AcceptanceInstrumentation"
 FIXTURE = "files/corevision-validation"
-INSTRUMENTATION_TIMEOUT = 165
+INSTRUMENTATION_TIMEOUT = 240
 
 
 def adb_command(args, *command):
@@ -142,6 +143,19 @@ def validate(args, report_dir):
     elif args.compare_input is not None:
         mode = "comparison"
         fixture, second_fixture = args.compare_input
+    elif args.object_input is not None:
+        mode, fixture = "objects", args.object_input
+    elif args.skeleton_input is not None:
+        mode, fixture = "skeletons", args.skeleton_input
+    elif args.super_resolution_input is not None:
+        mode, fixture = "super-resolution", args.super_resolution_input
+    elif args.ocr_input is not None:
+        mode, fixture = "ocr", args.ocr_input
+    elif args.subject_input is not None:
+        mode, fixture = "subjects", args.subject_input
+    elif args.search_input is not None:
+        mode = "image-search"
+        fixture, second_fixture = args.search_input
     elif fixture is not None:
         mode = "faces"
     options = ["-e", "mode", mode]
@@ -151,9 +165,20 @@ def validate(args, report_dir):
         options += ["-e", "width", str(args.width), "-e", "height", str(args.height)]
     if args.face_count is not None:
         options += ["-e", "faceCount", str(args.face_count)]
+    if args.object_label is not None:
+        options += ["-e", "objectLabel", str(args.object_label)]
+    if args.skeleton_count is not None:
+        options += ["-e", "skeletonCount", str(args.skeleton_count)]
+    if args.expected_text is not None:
+        options += ["-e", "expectedText", shlex.quote(args.expected_text)]
+    if args.ocr_min_block_lines is not None:
+        options += ["-e", "ocrMinBlockLines", str(args.ocr_min_block_lines)]
+    if args.subject_count is not None:
+        options += ["-e", "subjectCount", str(args.subject_count)]
     if second_fixture is not None:
         push_fixture(args, second_fixture, "second.rgba")
-        options += ["-e", "expectMatch", str(args.expect_match == "yes").lower()]
+        if mode == "comparison":
+            options += ["-e", "expectMatch", str(args.expect_match == "yes").lower()]
 
     result = run_instrumentation(args, options, report_dir / "instrumentation.log")
     if "INSTRUMENTATION_RESULT: corevision=PASS " not in result or "INSTRUMENTATION_CODE: -1" not in result:
@@ -162,7 +187,21 @@ def validate(args, report_dir):
     if args.face_count is not None:
         metadata["face_count"] = args.face_count
         metadata["blank_face_count"] = 0
-    if second_fixture is not None:
+    if args.object_label is not None:
+        metadata["object_label"] = args.object_label
+        metadata["blank_object_count"] = 0
+    if args.skeleton_count is not None:
+        metadata["skeleton_count"] = args.skeleton_count
+        metadata["blank_skeleton_count"] = 0
+    if args.super_resolution_input is not None:
+        metadata["super_resolution_dimensions"] = [args.width * 4, args.height * 4]
+    if args.ocr_input is not None:
+        metadata["ocr"] = "passed positive and blank fixtures"
+    if args.subject_input is not None:
+        metadata["subject_count"] = args.subject_count
+    if args.search_input is not None:
+        metadata["image_search"] = "passed ranking, persistence, scopes, deletion and clear"
+    if mode == "comparison":
         prefix = "INSTRUMENTATION_RESULT: similarity="
         scores = [line.removeprefix(prefix) for line in result.splitlines() if line.startswith(prefix)]
         if len(scores) != 1:
@@ -204,9 +243,20 @@ def main():
     fixtures.add_argument("--baseline", type=Path)
     fixtures.add_argument("--face-input", type=Path, help="test face detection with a packed RGBA fixture")
     fixtures.add_argument("--compare-input", type=Path, nargs=2, metavar=("FIRST", "SECOND"), help="compare two equal-size RGBA fixtures")
+    fixtures.add_argument("--object-input", type=Path, help="test object detection with a packed RGBA fixture")
+    fixtures.add_argument("--skeleton-input", type=Path, help="test skeleton detection with a packed RGBA fixture")
+    fixtures.add_argument("--super-resolution-input", type=Path, help="test 4x super-resolution with a textured RGBA fixture")
+    fixtures.add_argument("--ocr-input", type=Path, help="test OCR with a packed RGBA fixture")
+    fixtures.add_argument("--subject-input", type=Path, help="test detailed segmentation with a multi-subject RGBA fixture")
+    fixtures.add_argument("--search-input", type=Path, nargs=2, metavar=("ASTRONAUT", "CAT"), help="test search with two equal-size RGBA fixtures")
     fixtures.add_argument("--expect-face-models-missing", action="store_true", help="test a matting-only APK")
     parser.add_argument("--face-count", type=int, help="expected number of faces in --face-input")
     parser.add_argument("--expect-match", choices=("yes", "no"), help="expected decision from --compare-input")
+    parser.add_argument("--object-label", type=int, help="an object label expected in --object-input")
+    parser.add_argument("--skeleton-count", type=int, help="expected number of skeletons with visible noses in --skeleton-input")
+    parser.add_argument("--expected-text", help="text expected in a line of the --ocr-input fixture")
+    parser.add_argument("--ocr-min-block-lines", type=int, help="minimum number of grouped lines expected in an OCR block")
+    parser.add_argument("--subject-count", type=int, help="expected number of subjects in --subject-input (2–6)")
     parser.add_argument("--width", type=int, default=1536)
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--worker-fault", choices=("kill", "stop"), help="verify recovery after worker death or deadline expiry")
@@ -218,6 +268,16 @@ def main():
         parser.error("--face-input and a nonnegative --face-count must be supplied together")
     if (args.expect_match is None) != (args.compare_input is None):
         parser.error("--compare-input and --expect-match must be supplied together")
+    if (args.object_label is None) != (args.object_input is None) or (args.object_label is not None and args.object_label < 0):
+        parser.error("--object-input and a nonnegative --object-label must be supplied together")
+    if (args.skeleton_count is None) != (args.skeleton_input is None) or (args.skeleton_count is not None and args.skeleton_count < 0):
+        parser.error("--skeleton-input and a nonnegative --skeleton-count must be supplied together")
+    if (args.expected_text is None) != (args.ocr_input is None) or args.expected_text == "":
+        parser.error("--ocr-input and a nonempty --expected-text must be supplied together")
+    if args.ocr_min_block_lines is not None and (args.ocr_input is None or args.ocr_min_block_lines < 1):
+        parser.error("--ocr-min-block-lines requires --ocr-input and a positive line count")
+    if (args.subject_count is None) != (args.subject_input is None) or (args.subject_count is not None and not 2 <= args.subject_count <= 6):
+        parser.error("--subject-input and a --subject-count between 2 and 6 must be supplied together")
     report_dir = args.report_dir or Path(tempfile.mkdtemp(prefix="corevision-device-"))
     report_dir = report_dir.resolve()
     if report_dir == ROOT or ROOT in report_dir.parents:

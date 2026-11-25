@@ -125,7 +125,10 @@ public final class WorkerService extends Service {
                 Wire.Response response = Wire.Response.read(pipe, request);
                 String metadata = Wire.metadata(pipe, response);
                 if (response.status() != 0) throw error(CoreVisionException.Code.fromValue(response.status()), metadata);
-                if (runtime != null) metadata = runtime.checkedMetadata(metadata, (request.flags() & Wire.COARSE) != 0);
+                if (runtime != null) {
+                    boolean audit = request.operation() == Wire.SEGMENT && (request.flags() & Wire.COARSE) != 0;
+                    metadata = runtime.checkedMetadata(metadata, audit);
+                }
                 byte[] encoded = metadata.getBytes(StandardCharsets.UTF_8);
                 if (encoded.length > Wire.MAX_METADATA) throw error(PROTOCOL, "Worker report is too large");
                 response.write(output, request.id(), encoded.length);
